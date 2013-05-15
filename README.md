@@ -265,13 +265,7 @@ ngx_lua defaults to *30*, overridable per worker process by using the `lua_socke
 
 *Default:* `false`
 
-Use sentinel to obtain the details of a Redis server to be used. Please be sure to (read these docs)[http://redis.io/topics/sentinel] in order to understand the capabilities and behaviours of Sentinel
-
-#### redis_use_sentinel
-
-*Default:* `false`
-
-Use Sentinel to obtain the details of a Redis server to be used. Please be sure to (read these docs)[http://redis.io/topics/sentinel] in order to understand the capabilities and behaviours of Sentinel.
+Use Sentinel to obtain the details of a Redis server to be used. Please be sure to [read the Sentinel docs](http://redis.io/topics/sentinel) in order to understand the capabilities and behaviours of Sentinel.
 
 #### redis_sentinels
 
@@ -279,11 +273,11 @@ Use Sentinel to obtain the details of a Redis server to be used. Please be sure 
 
 Provide a table of Sentinel hosts to try in order. Once connected Ledge will ask Sentinel for a master to use. If the master is down, it will try to connect to a slave instead (where writes will fail).
 
-#### redis_master_name
+#### redis_sentinel_master_name
 
 *Default:* `mymaster`
 
-The name of the master to use. Again, refer to the (Sentinel docs)[http://redis.io/topics/sentinel] for an explanation.
+The name of the master to use. Again, refer to the [Sentinel docs](http://redis.io/topics/sentinel) for an explanation.
 
 #### cache_key_spec
 
