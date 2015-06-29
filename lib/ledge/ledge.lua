@@ -2,6 +2,8 @@ local cjson = require "cjson"
 local http = require "resty.http"
 local http_headers = require "resty.http_headers"
 local resolver = require "resty.dns.resolver"
+local md5 = require "resty.md5"
+local resty_string = require "resty.string"
 local qless = require "resty.qless"
 local response = require "ledge.response"
 local h_util = require "ledge.header_util"
@@ -82,6 +84,10 @@ typedef unsigned char u_char;
 u_char * ngx_hex_dump(u_char *dst, const u_char *src, size_t len);
 int RAND_pseudo_bytes(u_char *buf, int num);
 ]]
+
+
+local cache_key_prefix = "ledge:cache"
+local entity_body_prefix = "ledge:entity_body"
 
 
 local function random_hex(len)
@@ -612,19 +618,38 @@ function _M.cache_key(self)
             ngx_var.uri,
             args,
         }
-        tbl_insert(key_spec, 1, "cache")
-        tbl_insert(key_spec, 1, "ledge")
+        tbl_insert(key_spec, 1, cache_key_prefix)
         self:ctx().cache_key = tbl_concat(key_spec, ":")
     end
     return self:ctx().cache_key
 end
 
 
-function _M.cache_key_chain(self)
+function _M.cache_key_chain(self, verify)
     if not self:ctx().cache_key_chain then
-        local cache_key = self:cache_key()
-        self:ctx().cache_key_chain = self:key_chain(cache_key)
+        local redis = self:ctx().redis
+        local key = self:cache_key()
+        local key_chain = self:key_chain(key)
+    
+        if verify then
+            local missing = false
+            for k, v in pairs(key_chain) do
+                if k ~= "root" and k ~= "fetching_lock" then
+                    local res = redis:exists(v)
+                    if not res or res == ngx_null or res == 0 then 
+                        missing = true
+                    end
+                else
+                    ngx.log(ngx.DEBUG, "TODO: key chain needs to know which keys are real (", k, ")")
+                end
+            end
+
+            if missing then return nil end
+        end
+
+        self:ctx().cache_key_chain = key_chain
     end
+
     return self:ctx().cache_key_chain
 end
 
@@ -633,13 +658,24 @@ function _M.key_chain(self, cache_key)
     return {
         root = cache_key,
         key = cache_key .. "::key",
-        memused = cache_key .. "::memused",
-        entities = cache_key .. "::entities",
+        headers = cache_key .. "::headers",
+        bodies = cache_key .. "::bodies",
         fetching_lock = cache_key .. "::fetching",
     }
 end
 
 
+function _M.body_key_chain(self, body_key)
+    return {
+        body = body_key,
+        size = body_key .. ":size",
+        esi_flags = body_key .. ":esi_flags",
+        keys = body_key .. ":keys",
+    }
+end
+
+
+--[[
 function _M.cache_entity_keys(self)
     local key_chain = self:cache_key_chain()
     local redis = self:ctx().redis
@@ -659,10 +695,12 @@ function _M.cache_entity_keys(self)
         end
     end
 
+    keys.entity_id = entity
     return keys
 end
+]]--
 
-
+--[[
 function _M.entity_keys(self, entity_key)
     return  {
         main = entity_key,
@@ -671,6 +709,7 @@ function _M.entity_keys(self, entity_key)
         body_esi = entity_key .. ":body_esi",
     }
 end
+]]--
 
 
 function _M.accepts_stale_error(self)
@@ -1795,18 +1834,18 @@ function _M.read_from_cache(self)
     local redis = self:ctx().redis
     local res = response.new()
 
-    local entity_keys = self:cache_entity_keys()
+    local key_chain = self:cache_key_chain(true)
 
-    if not entity_keys  then
+    if not key_chain then
         -- MISS
         return nil
     end
 
     -- Get our body reader coroutine for later
-    res.body_reader = self:get_cache_body_reader(entity_keys)
+    res.body_reader = self:get_cache_body_reader(key_chain)
 
     -- Read main metdata
-    local cache_parts, err = redis:hgetall(entity_keys.main)
+    local cache_parts, err = redis:hgetall(key_chain.key)
     if not cache_parts then
         ngx_log(ngx_ERR, err)
         return nil
@@ -1851,7 +1890,7 @@ function _M.read_from_cache(self)
     end
 
     -- Read headers
-    local headers = redis:hgetall(entity_keys.headers)
+    local headers = redis:hgetall(key_chain.headers)
     if headers then
         local headers_len = tbl_getn(headers)
 
@@ -2191,8 +2230,18 @@ function _M.save_to_cache(self, res)
     -- this key before we finish.
     redis:watch(key_chain.key)
 
+    local previous_body_key = redis:hget(key_chain.key, "body")
+    local previous_body_keys, previous_body_size
+    if previous_body_key and previous_body_key ~= ngx_null then
+        previous_body_keys = self:body_key_chain(previous_body_key)
+        previous_body_size = redis:get(previous_body_keys.size)
+    end
+
+
+
+--[[
     -- Create new entity keys
-    local entity = random_hex(8)
+    local entity = "tmp_" .. random_hex(8)
     local entity_keys = self:entity_keys(key_chain.root .. "::" .. entity)
 
     -- We'll need to mark the old entity for expiration shortly, as reads could still
@@ -2209,25 +2258,12 @@ function _M.save_to_cache(self, res)
             end
         end
     end
+    ]]--
 
     -- Start the transaction
     redis:multi()
-
-    if previous_entity_keys then
-        -- We use the previous entity size and the minimum download rate to calculate when to expire
-        -- the old entity, plus 1 second of arbitrary latency for good measure.
-        local dl_rate_Bps = self:config_get("minimum_old_entity_download_rate") * 128 -- Bytes in a kb
-        local gc_after = math_ceil((previous_entity_size / dl_rate_Bps)) + 1
-
-        -- Place this job on the queue
-        self:put_background_job("ledge", "ledge.jobs.collect_entity", {
-            cache_key_chain = key_chain,
-            size = previous_entity_size,
-            entity_keys = previous_entity_keys,
-        }, { delay = gc_after })
-    end
     
-    redis:hmset(entity_keys.main,
+    redis:hmset(key_chain.key,
         'status', res.status,
         'uri', uri,
         'expires', expires,
@@ -2236,24 +2272,22 @@ function _M.save_to_cache(self, res)
         'esi_scanned', tostring(res.esi_scanned)
     )
 
-    redis:hmset(entity_keys.headers, unpack(h))
+    redis:hmset(key_chain.headers, unpack(h))
 
     -- Mark the keys as eventually volatile (the body is set by the body writer)
     local keep_cache_for = ttl + tonumber(self:config_get("keep_cache_for"))
-    redis:expire(entity_keys.main, keep_cache_for)
-    redis:expire(entity_keys.headers, keep_cache_for)
-
-    -- Update main cache key pointer
-    redis:set(key_chain.key, entity)
     redis:expire(key_chain.key, keep_cache_for)
+    redis:expire(key_chain.headers, keep_cache_for)
 
     -- Instantiate writer coroutine with the entity key set.
     -- The writer will commit the transaction later.
     if res.has_body then
         res.body_reader = self:get_cache_body_writer(
             res.body_reader,
-            entity_keys,
-            keep_cache_for
+            key_chain,
+            keep_cache_for,
+            previous_body_keys,
+            previous_body_size
         )
     else
         -- Run transaction
@@ -2265,18 +2299,42 @@ end
 
 
 function _M.delete_from_cache(self)
+    local redis = self:ctx().redis
     local key_chain = self:cache_key_chain()
-    local entity_keys = self:cache_entity_keys()
-    if entity_keys then
-        local redis = self:ctx().redis
-        local keys = { key_chain.key, key_chain.entities, key_chain.memused }
-        local i = #keys
-        for k,v in pairs(entity_keys) do
-            i = i + 1
-            keys[i] = v
+    
+    local bodies, err = redis:zrange(key_chain.bodies, 0, -1)
+    if bodies then
+        for _, body in ipairs(bodies) do
+            local body_key_chain = self:body_key_chain(body)
+
+            ngx.log(ngx.DEBUG, "zrem ", body_key_chain.keys, " ", key_chain.key)
+            local ok, err = redis:zrem(body_key_chain.keys, key_chain.key)
+            if not ok then
+                ngx.log(ngx.ERR, err)
+            end
+        
+            local num_keys, err = redis:zcard(body_key_chain.keys)
+
+            ngx.log(ngx.DEBUG, "num_keys is now: ", num_keys)
+            if num_keys == 0 then
+                local keys = {}
+                for k,v in pairs(body_key_chain) do
+                    tbl_insert(keys, v)
+                end
+                
+                local ok, err = redis:del(unpack(keys))
+                if not ok then
+                    ngx_log(ngx.ERR, err)
+                end
+            end
         end
-        return redis:del(unpack(keys))
+
     end
+
+    -- Delete me
+    local keys = { key_chain.key, key_chain.headers, key_chain.bodies }
+
+    return redis:del(unpack(keys))
 end
 
 
@@ -2296,12 +2354,15 @@ function _M.scan_keys(self, cursor, key_chain, expired)
         for _,key in ipairs(res[2]) do
             local entity = redis:get(key)
             if entity then
+                ngx.log(ngx.ERR, "FIXME")
+                --[[
                 -- Remove the ::key part to give the cache_key without a suffix
                 local cache_key = str_sub(key, 1, -(str_len("::key") + 1))
                 expired = self:expire_keys(
                     self:key_chain(cache_key), -- a keychain for this key
                     self:entity_keys(cache_key .. "::" .. entity) -- the entity keys for the live entity
                 )
+                ]]--
             end
         end
 
@@ -2325,24 +2386,18 @@ function _M.expire(self)
     if ngx_re_find(key_chain.root, "\\*", "soj") then
         return self:scan_keys(0, key_chain)
     else
-        local entity_keys = self:cache_entity_keys()
-        if not entity_keys then
-            -- nothing to expire
-            return false
-        else
-            return self:expire_keys(key_chain, entity_keys)
-        end
+        return self:expire_keys(key_chain, entity_keys)
     end
 end
 
 
--- Expires the keys in key_chain and the entity provided by entity_keys
-function _M.expire_keys(self, key_chain, entity_keys)
+-- Expires the keys in key_chain.
+function _M.expire_keys(self, key_chain)
     local redis = self:ctx().redis
 
-    if redis:exists(entity_keys.main) == 1 then
+    if redis:exists(key_chain.key) == 1 then
         local time = ngx_time()
-        local expires, err = redis:hget(entity_keys.main, "expires")
+        local expires, err = redis:hget(key_chain.key, "expires")
         if not expires or expires == ngx_null then
             ngx_log(ngx_ERR, "could not determine existing expiry: ", err)
             return false
@@ -2353,7 +2408,7 @@ function _M.expire_keys(self, key_chain, entity_keys)
             return false
         end
 
-        local ttl = redis:ttl(entity_keys.main)
+        local ttl = redis:ttl(key_chain.key)
         if not ttl or ttl == ngx_null then
             ngx_log(ngx_ERR, "count not determine exsiting ttl: ", err)
             return false
@@ -2366,16 +2421,12 @@ function _M.expire_keys(self, key_chain, entity_keys)
 
         -- Set the expires field of the main key to the new time, to control
         -- its validity.
-        redis:hset(entity_keys.main, "expires", tostring(time - 1))
+        redis:hset(key_chain.key, "expires", tostring(time - 1))
 
         -- Set new TTLs for all keys in the key chain
         key_chain.fetching_lock = nil -- this looks after itself
+        key_chain.root = nil -- not a real key
         for _,key in pairs(key_chain) do
-            redis:expire(key, ttl - ttl_reduction)
-        end
-
-        -- Set new TTLs for all entity keys
-        for _,key in pairs(entity_keys) do
             redis:expire(key, ttl - ttl_reduction)
         end
 
@@ -2394,8 +2445,7 @@ end
 
 function _M.serve(self)
     if not ngx.headers_sent then
-        local res = self:get_response() -- or self:get_response("fetched")
-        assert(res.status, "Response has no status.") -- FIXME: This will bail hard on error.
+        local res = self:get_response()
 
         local visible_hostname = self:visible_hostname()
 
@@ -2455,10 +2505,12 @@ end
 
 
 -- Returns a wrapped coroutine to be resumed for each body chunk.
-function _M.get_cache_body_reader(self, entity_keys)
+function _M.get_cache_body_reader(self, key_chain)
     local redis = self:ctx().redis
 
-    local num_chunks = redis:llen(entity_keys.body) - 1
+    local body_key = redis:hget(key_chain.key, "body")
+
+    local num_chunks = redis:llen(body_key) - 1
     if num_chunks < 0 then return nil end
 
     local has_esi = false
@@ -2467,16 +2519,16 @@ function _M.get_cache_body_reader(self, entity_keys)
         local process_esi = self:ctx().esi_process_enabled
 
         for i = 0, num_chunks do
-            local chunk, err = redis:lindex(entity_keys.body, i)
+            local chunk, err = redis:lindex(body_key, i)
 
             -- Just for efficiency, we avoid the lookup. The body server is responsible
             -- for deciding whether to call process_esi() or not.
             if process_esi == true then
-                has_esi, err = redis:lindex(entity_keys.body_esi, i)
+                has_esi, err = redis:lindex(body_key .. ":esi_flags", i)
             end
 
             if chunk == ngx_null then
-                ngx_log(ngx_WARN, "entity removed during read, ", entity_keys.main)
+                ngx_log(ngx_WARN, "entity removed during read, ", key_chain.key)
                 self:e "entity_removed_during_read"
             end
 
@@ -2490,14 +2542,17 @@ end
 -- coroutine to be resumed which reads from the upstream socket.
 -- If we cross the max_memory boundary, we just keep yielding chunks to be served,
 -- after having removed the cache entry.
-function _M.get_cache_body_writer(self, reader, entity_keys, ttl)
+function _M.get_cache_body_writer(self, reader, key_chain, ttl, previous_body_keys, previous_body_size)
     local redis = self:ctx().redis
     local max_memory = (self:config_get("cache_max_memory") or 0) * 1024
     local deleted_due_to_size = false
     local esi_detected = false
 
     return co_wrap(function(buffer_size)
+        local tmp_key = self:body_key_chain("tmp_" .. random_hex(8))
+
         local size = 0
+        local md5sum = md5:new()
         repeat
             local chunk, err, has_esi = reader(buffer_size)
             if chunk then
@@ -2517,8 +2572,13 @@ function _M.get_cache_body_writer(self, reader, entity_keys, ttl)
                         ngx_log(ngx_NOTICE, "cache item deleted as it is larger than ",
                                             max_memory, " bytes")
                     else
-                        redis:rpush(entity_keys.body, chunk)
-                        redis:rpush(entity_keys.body_esi, tostring(has_esi))
+                        -- Update the md5 of this body. We include the chunk length to ensure
+                        -- the body md5 is unique against data *and* storage format.
+                        md5sum:update("--- #chunk ---" .. chunk)
+                        ngx.log(ngx.DEBUG, "chunksize: ", #chunk)
+
+                        redis:rpush(tmp_key.body, chunk)
+                        redis:rpush(tmp_key.esi_flags, tostring(has_esi))
 
                         if not esi_detected and has_esi then
                             local esi_parser = self:ctx().esi_parser
@@ -2526,7 +2586,7 @@ function _M.get_cache_body_writer(self, reader, entity_keys, ttl)
                                 ngx_log(ngx.ERR, "ESI detected but no parser identified")
                             else
                                 -- Flag this in the main key
-                                redis:hset(entity_keys.main, "has_esi", esi_parser.token)
+                                redis:hset(key_chain.key, "has_esi", esi_parser.token)
                                 esi_detected = true
                             end
                         end
@@ -2537,16 +2597,99 @@ function _M.get_cache_body_writer(self, reader, entity_keys, ttl)
         until not chunk
 
         if not deleted_due_to_size then
-            redis:hset(entity_keys.main, "size", size)
 
-            local key_chain = self:cache_key_chain()
-            redis:incrby(key_chain.memused, size)
-            redis:zadd(key_chain.entities, size, entity_keys.main)
+            -- Create body key using final md5sum
+            local body_key = self:body_key_chain(
+                entity_body_prefix .. ":" .. resty_string.to_hex(md5sum:final())    
+            )
+            ngx.log(ngx.DEBUG, "body key is: ", body_key.body)
 
-            redis:expire(key_chain.memused, ttl)
-            redis:expire(key_chain.entities, ttl)
-            redis:expire(entity_keys.body, ttl)
-            redis:expire(entity_keys.body_esi, ttl)
+            redis:set(body_key.size, size)
+                
+            -- Rename tmp keys
+            for k,v in pairs(body_key) do
+                redis:rename(tmp_key[k], body_key[k])
+            end
+    
+            -- Sets a key's expiry only if there was no previous expiry set
+            -- or if the new ttl is longer than the existing expiry.
+            -- Params: key, ttl
+            -- Return: (integer): 
+            --  * 1 if the timeout was set.
+            --  * 0 if key does not exist or the timeout could not be set.
+            local EXPIRENXG = [[
+                local value = redis.call("TTL", KEYS[1])
+                if value then
+                    value = tonumber(value)
+                    if value == -1 or value < ARGV[1] then
+                        return redis.call("EXPIRE", KEYS[1], ARGV[1])
+                    else
+                        return 0
+                    end
+                else
+                    return 0
+                end
+            ]]
+            
+            redis:eval(EXPIRENXG, 1, body_key.body, ttl)
+            redis:eval(EXPIRENXG, 1, body_key.esi_flags, ttl)
+            redis:eval(EXPIRENXG, 1, body_key.size, ttl)
+
+            -- Update main cache key to point to this body
+            redis:hset(key_chain.key, "body", body_key.body)
+            redis:hset(key_chain.key, "size", size)
+
+            -- Add to or create a "bodies" set for tracking number of bodies associated with a key
+            redis:zadd(key_chain.bodies, size, body_key.body)
+            redis:expire(key_chain.bodies, ttl)
+
+            -- Add key to body ref sorted set, only if the score is higher (i.e. don't reduce the ttl).
+            -- Params: score, key
+            -- Return: (integer): The number of elements added.
+            local ZADDNXG = [[
+                local score = redis.call("ZSCORE", KEYS[1], ARGV[2])
+                if score then
+                    score = tonumber(score)
+                    if ARGV[1] > score then
+                        return redis.call("ZADD", KEYS[1], ARGV[1], ARGV[2])
+                    else
+                        return 0
+                    end
+                else
+                    return redis.call("ZADD", KEYS[1], ARGV[1], ARGV[2])
+                end
+            ]]
+            redis:eval(ZADDNXG, 1, body_key.keys, ngx_time() + ttl, key_chain.key)
+
+
+            local MEMUSED = [[
+                local bodies = redis.call("zrange", KEYS[1] .. "::bodies", 0, -1, "WITHSCORES")
+                local size = 0
+                for i,v in ipairs(bodies) do 
+                    local elem_size = redis.call("get", v .. ":size")
+                    if elem_size then 
+                        size = size + tonumber(elem_size) end
+                    end
+                end
+                return size
+            ]]
+
+            redis:hincrby(key_chain.key, "memused", size)
+
+
+            if previous_body_keys and previous_body_keys.body ~= body_key.body then
+                ngx.log(ngx.DEBUG, "entity is now different, gc")
+                -- We use the previous entity size and the minimum download rate to calculate when to expire
+                -- the old entity, plus 1 second of arbitrary latency for good measure.
+                local dl_rate_Bps = self:config_get("minimum_old_entity_download_rate") * 128 -- Bytes in a kb
+                local gc_after = math_ceil((previous_body_size / dl_rate_Bps)) + 1
+
+                -- Place this job on the queue
+                self:put_background_job("ledge", "ledge.jobs.collect_entity", {
+                    cache_key_chain = key_chain,
+                    body_key_chain = previous_body_keys,
+                }, { delay = gc_after })
+            end
 
             local res, err = redis:exec()
             if err then
