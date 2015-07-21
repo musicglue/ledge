@@ -51,57 +51,12 @@ end
 
 
 function _M.is_cacheable(self)
-    -- Never cache partial content
-    if self.status == 206 then
-        return false
-    end
-
-    for k,v in pairs(NOCACHE_HEADERS) do
-        for i,h in ipairs(v) do
-            if self.header[k] and self.header[k] == h then
-                return false
-            end
-        end
-    end
-
-    if self:ttl() > 0 then
-        return true
-    else
-        return false
-    end
+    return true
 end
 
 
 function _M.ttl(self)
-    -- Header precedence is Cache-Control: s-maxage=NUM, Cache-Control: max-age=NUM,
-    -- and finally Expires: HTTP_TIMESTRING.
-    local cc = self.header["Cache-Control"]
-    if cc then
-        if type(cc) == "table" then
-            cc = tbl_concat(cc, ", ")
-        end
-        local max_ages = {}
-        for max_age in ngx_re_gmatch(cc, 
-            "(s\\-maxage|max\\-age)=(\\d+)", 
-            "io") do
-            max_ages[max_age[1]] = max_age[2]
-        end
-
-        if max_ages["s-maxage"] then
-            return tonumber(max_ages["s-maxage"])
-        elseif max_ages["max-age"] then
-            return tonumber(max_ages["max-age"])
-        end
-    end
-
-    -- Fall back to Expires.
-    local expires = self.header["Expires"]
-    if expires then 
-        local time = ngx_parse_http_time(expires)
-        if time then return time - ngx_time() end
-    end
-
-    return 0
+    return 86400
 end
 
 

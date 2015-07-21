@@ -2079,6 +2079,8 @@ function _M.fetch_from_origin(self)
         headers[k] = v
     end
 
+    headers['host'] = self:config_get("upstream_host")
+
     -- Advertise ESI surrogate capabilities
     if self:config_get("esi_enabled") then
         local capability_entry = ngx_var.host .. '="' .. esi_capabilities() .. '"'
